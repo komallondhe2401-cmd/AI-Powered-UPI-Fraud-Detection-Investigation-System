@@ -2,17 +2,41 @@ from pathlib import Path
 
 import joblib
 import pandas as pd
+import requests
 import streamlit as st
 
 st.set_page_config(page_title="UPI Fraud Detection", page_icon="🛡️", layout="centered")
 
 # Relative path so it works locally and on Streamlit Cloud
 MODEL_PATH = Path(__file__).resolve().parent.parent / "Model" / "isolation_forest.pkl"
+DATA_PATH = Path(__file__).resolve().parent.parent / "Dataset" / "upi_transaction.csv"
+API_URL = "http://127.0.0.1:8000/investigate"
 
 
 @st.cache_resource
 def load_model():
     return joblib.load(MODEL_PATH)
+
+
+@st.cache_data
+def load_iqr_bounds():
+    """Same IQR rule as the notebook, computed on the raw amounts."""
+    try:
+        amounts = pd.read_csv(DATA_PATH, usecols=["amount_inr"])["amount_inr"]
+    except Exception:
+        return None
+    q1, q3 = amounts.quantile(0.25), amounts.quantile(0.75)
+    iqr = q3 - q1
+    return q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+
+def risk_level_from_score(score):
+    # Same mapping as the notebook: 0 Normal, 1 Review, 2+ High Risk
+    if score == 0:
+        return "Normal"
+    if score == 1:
+        return "Review"
+    return "High Risk"
 
 
 model = load_model()
@@ -131,15 +155,83 @@ if st.button("Check transaction", type="primary", use_container_width=True):
     pred = model.predict(X)[0]
     score = float(model.decision_function(X)[0])
 
-    # Placeholder tiers: set cutoffs from percentiles of decision_function on your training data
-    if pred == -1:
-        st.error("🚨 High Risk: flagged as anomalous")
-    elif score < 0.02:
-        st.warning("⚠️ Medium Risk: normal, but close to the boundary")
+    # Combine signals like the notebook: IQR outlier + Isolation Forest.
+    # time_anomaly needs daily volume history, so it is 0 for one transaction.
+    bounds = load_iqr_bounds()
+    iqr_outlier = int(bounds is not None and not (bounds[0] <= values["amount"] <= bounds[1]))
+    anomaly = int(pred == -1)
+    risk_score = iqr_outlier + anomaly
+    risk_level = risk_level_from_score(risk_score)
+
+    # Keep the result in session_state so it survives the rerun that
+    # happens when the "Explain with AI" button is clicked.
+    st.session_state["result"] = {
+        "features": X,
+        "anomaly_score": score,
+        "transaction": {
+            "amount_inr": values["amount"],
+            "risk_score": risk_score,
+            "risk_level": risk_level,
+            "is_suspicious": int(risk_score > 0),
+            "is_new_device": payload["is_new_device"],
+            "device_change": payload["device_change"],
+            "iqr_outlier": iqr_outlier,
+            "anomaly": anomaly,
+            "time_anomaly": 0,
+            "amount_to_balance_ratio": payload["amount_to_balance_ratio"],
+            "amount_to_hist_avg_ratio": payload["amount_to_hist_avg_ratio"],
+            "amount_zscore": payload["amount_zscore"],
+        },
+    }
+    st.session_state.pop("report", None)  # clear any old AI report
+
+result = st.session_state.get("result")
+
+if result:
+    tx = result["transaction"]
+
+    if tx["risk_level"] == "High Risk":
+        st.error("🚨 High Risk")
+    elif tx["risk_level"] == "Review":
+        st.warning("⚠️ Review: one risk signal triggered")
     else:
         st.success("✅ Normal")
 
-    st.metric("Anomaly score", f"{score:.4f}", help="Below 0 is anomalous. Lower means more suspicious.")
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Risk score (0-2)", tx["risk_score"])
+    m2.metric("Anomaly score", f"{result['anomaly_score']:.4f}",
+              help="Below 0 is anomalous. Lower means more suspicious.")
+    m3.metric("IQR outlier", "Yes" if tx["iqr_outlier"] else "No")
 
     with st.expander("Features sent to the model"):
-        st.dataframe(X.T.rename(columns={0: "value"}))
+        st.dataframe(result["features"].T.rename(columns={0: "value"}))
+
+    st.subheader("AI investigation")
+    engine = st.radio("AI engine", ["gemini", "local"], horizontal=True,
+                      help="'local' needs Ollama running with llama3.2.")
+
+    if st.button("Explain with AI", use_container_width=True):
+        try:
+            with st.spinner("Asking the AI investigator..."):
+                resp = requests.post(
+                    API_URL,
+                    json={"transaction": tx, "engine": engine},
+                    timeout=200,
+                )
+            if resp.ok:
+                st.session_state["report"] = resp.json()
+            else:
+                detail = resp.json().get("detail", resp.text)
+                st.error(f"API error {resp.status_code}: {detail}")
+        except requests.exceptions.ConnectionError:
+            st.error(
+                "Cannot reach the backend. Start it first:\n\n"
+                "`cd Backend` then `python -m uvicorn main:app --reload`"
+            )
+        except Exception as exc:
+            st.error(f"Request failed: {exc}")
+
+    report = st.session_state.get("report")
+    if report:
+        st.markdown(report["investigation_report"])
+        st.caption(report["warning"])

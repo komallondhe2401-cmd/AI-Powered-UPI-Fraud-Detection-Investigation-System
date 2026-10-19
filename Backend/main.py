@@ -1,81 +1,89 @@
-from fastapi import FastAPI
+from typing import Any, Literal
+
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import joblib
-import pandas as pd
 
-app = FastAPI(title="UPI Fraud Detection API", version="0.1.0")
+from ai_assistant import (
+    explain_with_gemini,
+    explain_with_local_ai,
+)
 
-model = joblib.load("C:/Users/Isha/Desktop/AI_ML/UPI_Fraud_Detection/Model/isolation_forest.pkl")
-FEATURES = list(model.feature_names_in_)
-
-
-class Transaction(BaseModel):
-    amount_inr: float
-    mcc: float
-    latitude: float
-    longitude: float
-    distance_from_home_km: float
-    device_age_hours: float
-    is_new_device: int
-    is_rooted_or_emulator: int
-    sim_swap_last_7d: int
-    hour_of_day: int
-    day_of_month: int
-    is_weekend: int
-    is_night_txn: int
-    usual_hour_start: int
-    usual_hour_end: int
-    is_unusual_hour: int
-    sender_account_age_days: float
-    hist_avg_amount: float
-    hist_std_amount: float
-    hist_avg_daily_txns: float
-    balance_before_txn: float
-    amount_to_balance_ratio: float
-    amount_to_hist_avg_ratio: float
-    amount_zscore: float
-    txn_count_last_1h: int
-    txn_count_last_24h: int
-    amount_sum_last_24h: float
-    mins_since_prev_txn: float
-    km_from_prev_txn: float
-    speed_kmph_from_prev: float
-    receiver_account_age_days: float
-    is_first_time_receiver: int
-    same_receiver_txn_count_24h: int
-    same_receiver_txn_count_7d: int
-    receiver_unique_senders_7d: int
-    sender_avg_amount: float
-    amount_deviation: float
-    amount_ratio: float
-    user_transaction_count: int
-    recipient_transaction_count: int
-    device_change: int
+app = FastAPI(
+    title="UPI Fraud Investigation Assistant",
+    description="AI explanations for suspicious transactions",
+    version="1.0.0",
+)
 
 
-class Prediction(BaseModel):
-    anomaly: int
-    risk_level: str
-    alert: bool
-    anomaly_score: float
+class InvestigationRequest(BaseModel):
+    transaction: dict[str, Any]
+    engine: Literal["gemini", "local"] = "local"
+
+
+# Column names in upi_transactions_analyzed.csv differ from the names the
+# API uses, so map them here. This lets a CSV row be sent as-is.
+ALIASES = {
+    "final_risk_score": "risk_score",
+    "final_risk_level": "risk_level",
+    "is_anomaly": "anomaly",
+}
+
+
+def normalize_transaction(transaction: dict[str, Any]) -> dict[str, Any]:
+    cleaned = dict(transaction)
+    for old_name, new_name in ALIASES.items():
+        if new_name not in cleaned and old_name in cleaned:
+            cleaned[new_name] = cleaned[old_name]
+    return cleaned
 
 
 @app.get("/")
 def home():
-    return {"message": "UPI Fraud Detection API is running"}
+    return {
+        "message": "UPI Fraud Investigation API is running"
+    }
 
 
-@app.post("/predict", response_model=Prediction)
-def predict(transaction: Transaction):
-    data = pd.DataFrame([transaction.model_dump()])[FEATURES]
+@app.post("/investigate")
+def investigate(request: InvestigationRequest):
+    transaction = normalize_transaction(request.transaction)
 
-    pred = model.predict(data)[0]
-    score = model.decision_function(data)[0]
-    is_anomaly = pred == -1
+    # This first version explains an existing risk result.
+    if "risk_score" not in transaction:
+        raise HTTPException(
+            status_code=400,
+            detail="Transaction must include risk_score."
+        )
 
-    return Prediction(
-        anomaly=int(is_anomaly),
-        risk_level="High Risk" if is_anomaly else "Normal",
-        alert=bool(is_anomaly),
-        anomaly_score=float(score),
-    )
+    if "risk_level" not in transaction:
+        raise HTTPException(
+            status_code=400,
+            detail="Transaction must include risk_level."
+        )
+
+    try:
+        if request.engine == "gemini":
+            explanation = explain_with_gemini(transaction)
+        else:
+            explanation = explain_with_local_ai(transaction)
+
+    except Exception as exc:
+        # Avoid returning API keys or internal details to the caller.
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "AI request failed. Check your API key, "
+                "model availability, or local AI server."
+            ),
+        ) from exc
+
+    return {
+        "risk_score": transaction["risk_score"],
+        "risk_level": transaction["risk_level"],
+        "ai_engine": request.engine,
+        "investigation_report": explanation,
+        "warning": (
+            "AI-generated guidance only. "
+            "This is not confirmation of fraud."
+        ),
+    }
